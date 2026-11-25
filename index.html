@@ -48,6 +48,13 @@
   li .t { color:var(--muted); white-space:nowrap; font-size:12px; }
   .btnrow { display:flex; gap:8px; margin-top:8px; }
   .hidden { display:none !important; }
+  .slot { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; border-top:1px solid var(--line); font-size:14px; }
+  .slot:first-child { border-top:0; }
+  .slot .k { color:var(--muted); min-width:112px; }
+  .slot .v { font-family:ui-monospace,Menlo,monospace; word-break:break-all; flex:1; }
+  .slot .x { width:34px; padding:4px; font-size:14px; background:#2a3a4a; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .chips button { width:auto; padding:8px 10px; font-size:14px; }
 </style>
 </head>
 <body>
@@ -96,6 +103,18 @@
 
 <div id="result" class="card">
   <div class="muted">Nothing scanned yet.</div>
+</div>
+
+<div class="card" id="deviceCard">
+  <label>Current device: scan each barcode on the box, then tap Save device</label>
+  <div id="slots"></div>
+  <div id="pending"></div>
+  <input id="notes" placeholder="Notes (optional)" style="margin-top:8px">
+  <div class="btnrow">
+    <button id="saveDev">Save device</button>
+    <button id="clearDev" class="secondary">Clear</button>
+  </div>
+  <div id="devStatus" class="status"></div>
 </div>
 
 <div class="card">
@@ -172,7 +191,7 @@ function flushQueue() {
   if (flushing) return; var q = getQueue(); if (!q.length) return; flushing = true;
   (function next(i) {
     if (i >= q.length) { flushing = false; return; }
-    callServer('recordScan', q[i]).then(function () {
+    callServer(q[i].fn || 'recordScan', q[i].payload || q[i]).then(function () {
       var cur = getQueue().filter(function (x) { return x.id !== q[i].id; }); setQueue(cur); next(i + 1);
     }).catch(function () { flushing = false; });
   })(0);
@@ -215,13 +234,15 @@ function beep(freq, ms) {
 function handleCode(raw, format) {
   var code = String(raw || '').trim();
   if (!code) return;
-  if ($('stripS').checked && /^S/i.test(code) && code.length > 1) code = code.slice(1);
+  var field = classify(code, format);
+  if (field === 'serial' && $('stripS').checked && /^S/i.test(code) && code.length > 1) code = code.slice(1);
   var scan = {
     id: uuid(), code: code, format: format || 'MANUAL',
     deviceType: $('deviceType').value.trim(), scannedBy: $('scannedBy').value.trim(),
     location: $('location').value, ts: new Date().toISOString()
   };
   lastScan = scan;
+  assignToDraft(code, field);
   var entry = { code: code, when: new Date(), flag: '' };
   recent.unshift(entry); if (recent.length > 10) recent.pop(); renderRecent();
   showResult(code, format, '<span class="muted">Saving...</span>', false);
@@ -240,7 +261,7 @@ function handleCode(raw, format) {
     }
     renderRecent(); flushQueue();
   }).catch(function (e) {
-    var q = getQueue(); q.push(scan); setQueue(q);
+    var q = getQueue(); q.push({ fn: 'recordScan', payload: scan, id: scan.id }); setQueue(q);
     entry.flag = 'queued'; flash('bad'); beep(200, 300); renderRecent();
     showResult(code, format, '<span class="bad">Not sent (' + esc(e.message) + '). Kept on this phone and will retry.</span>', false);
   });
@@ -259,6 +280,79 @@ function undoLast() {
     $('result').innerHTML = '<div class="status bad">Could not undo: ' + esc(e.message) + '</div>';
   });
 }
+
+// ---------------- Current device (one row per device on the "Devices" tab) ----------------
+var SLOTS = [['serial', 'Serial'], ['part', 'Part / Model No.'], ['upc', 'UPC'], ['imei', 'IMEI'],
+             ['imei2', 'IMEI 2'], ['eid', 'EID'], ['other', 'Asset tag / other']];
+var draft = loadDraft();
+function newDraft() { return { id: uuid(), fields: {}, pending: '' }; }
+function loadDraft() { try { var d = JSON.parse(store.get('ds_draft')); if (d && d.fields) return d; } catch (e) {} return newDraft(); }
+function saveDraftLocal() { store.set('ds_draft', JSON.stringify(draft)); }
+
+// Guess which slot a scanned code belongs in. Returns null when unsure, and you pick.
+function classify(code, fmt) {
+  var c = String(code).trim();
+  if (/^(UPC_A|UPC_E|EAN_13|EAN_8)$/.test(fmt)) return 'upc';
+  if (/^\d{15}$/.test(c)) return (draft.fields.imei && draft.fields.imei !== c) ? 'imei2' : 'imei';
+  if (/^\d{32}$/.test(c)) return 'eid';
+  if (/^[A-Z0-9]{3,6}[A-Z]{1,3}\/[A-Z0-9]$/i.test(c) || /^A\d{4}$/i.test(c)) return 'part';
+  if (/^(QR_CODE|DATA_MATRIX|AZTEC|PDF_417)$/.test(fmt)) return 'other';
+  if (/^[A-Z0-9]{8,12}$/i.test(c) && /[A-Z]/i.test(c) && /\d/.test(c)) return 'serial';
+  return null;
+}
+function assignToDraft(code, field) {
+  if (field) { draft.fields[field] = code; draft.pending = ''; }
+  else { draft.pending = code; }
+  saveDraftLocal(); renderDraft();
+}
+function renderDraft() {
+  $('slots').innerHTML = SLOTS.map(function (s) {
+    var v = draft.fields[s[0]];
+    return '<div class="slot"><span class="k">' + esc(s[1]) + '</span><span class="v">' +
+      (v ? esc(v) : '<span class="muted">-</span>') + '</span>' +
+      (v ? '<button class="x" data-k="' + s[0] + '" aria-label="Clear ' + esc(s[1]) + '">x</button>' : '') + '</div>';
+  }).join('');
+  Array.prototype.forEach.call(document.querySelectorAll('#slots .x'), function (b) {
+    b.addEventListener('click', function () { delete draft.fields[b.getAttribute('data-k')]; saveDraftLocal(); renderDraft(); });
+  });
+  if (draft.pending) {
+    $('pending').innerHTML = '<div class="muted" style="margin-top:8px">What is <b>' + esc(draft.pending) + '</b>?</div><div class="chips">' +
+      SLOTS.map(function (s) { return '<button class="secondary pickslot" data-k="' + s[0] + '">' + esc(s[1]) + '</button>'; }).join('') +
+      '<button class="secondary pickslot" data-k="">Ignore</button></div>';
+    Array.prototype.forEach.call(document.querySelectorAll('.pickslot'), function (b) {
+      b.addEventListener('click', function () {
+        var k = b.getAttribute('data-k');
+        if (k) draft.fields[k] = draft.pending;
+        draft.pending = ''; saveDraftLocal(); renderDraft();
+      });
+    });
+  } else { $('pending').innerHTML = ''; }
+  $('notes').value = draft.notes || '';
+}
+$('notes').addEventListener('input', function () { draft.notes = $('notes').value; saveDraftLocal(); });
+function resetDraft() { draft = newDraft(); saveDraftLocal(); renderDraft(); }
+$('clearDev').addEventListener('click', function () { resetDraft(); $('devStatus').innerHTML = ''; });
+$('saveDev').addEventListener('click', function () {
+  var f = draft.fields;
+  if (!(f.serial || f.imei || f.imei2 || f.eid || f.other)) {
+    $('devStatus').innerHTML = '<span class="warn">Scan a serial, IMEI, EID or asset tag first.</span>'; return;
+  }
+  var payload = { id: draft.id, fields: f, notes: ($('notes').value || '').trim(), deviceType: $('deviceType').value.trim(),
+                  scannedBy: $('scannedBy').value.trim(), location: $('location').value, ts: new Date().toISOString() };
+  $('devStatus').innerHTML = '<span class="muted">Saving...</span>';
+  callServer('saveDevice', payload).then(function (res) {
+    if (!res || !res.ok) throw new Error((res && res.error) || 'Server said no');
+    $('devStatus').innerHTML = res.existing
+      ? '<span class="warn">Already in the list (first saved ' + esc(res.firstSaved || '') + '). Updated that row.</span>'
+      : '<span class="ok">Device saved. Ready for the next one.</span>';
+    beep(res.existing ? 330 : 880, 150); resetDraft();
+  }).catch(function (e) {
+    var q = getQueue(); q.push({ fn: 'saveDevice', payload: payload, id: payload.id }); setQueue(q);
+    $('devStatus').innerHTML = '<span class="bad">Not sent (' + esc(e.message) + '). Kept on this phone and will retry.</span>';
+    resetDraft();
+  });
+});
+renderDraft();
 
 // ---------------- Camera scanning ----------------
 var scanning = false, stream = null, timer = null;
