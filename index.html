@@ -29,7 +29,7 @@
   button:disabled { opacity:.5; }
   .video-wrap { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:4/3; margin-bottom:10px; }
   video { width:100%; height:100%; object-fit:cover; display:block; }
-  .reticle { position:absolute; inset:18% 8%; border:2px solid rgba(255,255,255,.7); border-radius:10px; pointer-events:none; }
+  .reticle { position:absolute; left:5%; top:37%; width:90%; height:26%; border:2px solid rgba(255,255,255,.85); border-radius:10px; pointer-events:none; box-shadow:0 0 0 9999px rgba(0,0,0,.35); }
   .flash { position:absolute; inset:0; pointer-events:none; opacity:0; transition:opacity .35s; }
   .flash.ok { background:rgba(47,191,113,.45); opacity:1; transition:none; }
   .flash.warn { background:rgba(242,169,59,.5); opacity:1; transition:none; }
@@ -75,11 +75,19 @@
   <label class="check"><input type="checkbox" id="stripS"> Apple box serial: remove leading "S" from the barcode</label>
 </div>
 
-<div class="video-wrap">
+<div class="video-wrap" id="videoWrap">
   <video id="video" playsinline muted></video>
-  <div class="reticle"></div>
+  <div class="reticle" id="reticle"></div>
   <div id="flash" class="flash"></div>
-  <div id="placeholder" class="placeholder">Tap Start scanning, then point the camera at a barcode or QR code.</div>
+  <div id="placeholder" class="placeholder">Tap Start scanning, then line the white box up with ONE barcode or QR code.</div>
+</div>
+<div style="margin:0 0 8px">
+  <label for="aim">Aim box (only the barcode inside the white box is read)</label>
+  <select id="aim">
+    <option value="wide">Wide box: barcodes</option>
+    <option value="square">Square box: QR codes</option>
+    <option value="full">Whole screen: any code</option>
+  </select>
 </div>
 <div class="btnrow" style="margin:0 0 12px">
   <button id="startBtn">Start scanning</button>
@@ -253,39 +261,104 @@ function undoLast() {
 }
 
 // ---------------- Camera scanning ----------------
-var reader = null; var scanning = false;
+var scanning = false, stream = null, timer = null;
 var lastCode = '', lastTime = 0;
+var work = document.createElement('canvas');
+var wctx = work.getContext('2d', { willReadFrequently: true });
+var mfr = null, HINTS = null;
 
 function formats() {
   var F = ZXing.BarcodeFormat;
   return [F.CODE_128, F.QR_CODE, F.EAN_13, F.UPC_A, F.UPC_E, F.EAN_8, F.CODE_39, F.CODE_93, F.ITF, F.DATA_MATRIX, F.PDF_417, F.AZTEC];
 }
-function newReader() {
-  var hints = new Map();
-  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats());
-  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-  return new ZXing.BrowserMultiFormatReader(hints, 250);
+function decodeCanvas(c) {
+  if (!mfr) {
+    HINTS = new Map();
+    HINTS.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats());
+    HINTS.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    mfr = new ZXing.MultiFormatReader();
+  }
+  try {
+    var src = new ZXing.HTMLCanvasElementLuminanceSource(c);
+    var r = mfr.decode(new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src)), HINTS);
+    return { text: r.getText(), format: ZXing.BarcodeFormat[r.getBarcodeFormat()] };
+  } catch (e) { return null; }
+}
+
+// The aim box, in pixels inside the video area.
+function currentBox() {
+  var wrap = $('videoWrap'), cw = wrap.clientWidth, ch = wrap.clientHeight, m = $('aim').value;
+  if (m === 'full') return { x: 0, y: 0, w: cw, h: ch };
+  if (m === 'square') { var s = Math.round(0.7 * Math.min(cw, ch)); return { x: (cw - s) / 2, y: (ch - s) / 2, w: s, h: s }; }
+  return { x: cw * 0.05, y: ch * 0.37, w: cw * 0.9, h: ch * 0.26 };
+}
+function placeReticle() {
+  var b = currentBox(), r = $('reticle');
+  r.style.left = b.x + 'px'; r.style.top = b.y + 'px'; r.style.width = b.w + 'px'; r.style.height = b.h + 'px';
+  r.style.display = $('aim').value === 'full' ? 'none' : 'block';
+}
+// Convert the box on screen to the matching area of the camera picture (the video is shown "cover" style).
+function videoRect(b) {
+  var v = $('video'), wrap = $('videoWrap'), vw = v.videoWidth, vh = v.videoHeight;
+  var cw = wrap.clientWidth, ch = wrap.clientHeight, s = Math.max(cw / vw, ch / vh);
+  var ox = (vw * s - cw) / 2, oy = (vh * s - ch) / 2;
+  return { sx: (b.x + ox) / s, sy: (b.y + oy) / s, sw: b.w / s, sh: b.h / s };
+}
+
+$('aim').value = store.get('ds_aim') || 'wide';
+$('aim').addEventListener('change', function () { store.set('ds_aim', $('aim').value); placeReticle(); });
+window.addEventListener('resize', placeReticle);
+placeReticle();
+
+function tick() {
+  if (!scanning) return;
+  var v = $('video');
+  if (v.videoWidth && v.readyState >= 2) {
+    var r = videoRect(currentBox());
+    var base = 1;
+    if (r.sw < 900) base = Math.min(2, 900 / r.sw);          // small areas: enlarge a little
+    if (r.sw * base > 1800) base = 1800 / r.sw;              // big areas: keep it quick
+    var res = null, tries = [base, base * 2, base * 3];     // if the first pass misses, retry enlarged (helps small or far-away codes)
+    for (var t = 0; t < tries.length && !res; t++) {
+      var sc = tries[t];
+      if (t > 0 && r.sw * sc > 2600) break;
+      work.width = Math.max(1, Math.round(r.sw * sc)); work.height = Math.max(1, Math.round(r.sh * sc));
+      wctx.imageSmoothingEnabled = true; wctx.imageSmoothingQuality = 'high';
+      wctx.drawImage(v, r.sx, r.sy, r.sw, r.sh, 0, 0, work.width, work.height);
+      res = decodeCanvas(work);
+    }
+    if (res) {
+      var now = Date.now();
+      if (res.text === lastCode && now - lastTime < 4000) { lastTime = now; }   // same code still in view
+      else { lastCode = res.text; lastTime = now; handleCode(res.text, res.format); }
+    }
+  }
+  timer = setTimeout(tick, 120);
 }
 
 function startScan() {
   if (typeof ZXing === 'undefined') {
     $('placeholder').textContent = 'The scanner library did not load. Check your connection and reload.'; return;
   }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('placeholder').innerHTML = 'Camera not available here.<br>Use <b>Take photo</b> or type the code below.'; return;
+  }
   $('placeholder').classList.add('hidden');
   $('startBtn').classList.add('hidden'); $('stopBtn').classList.remove('hidden');
   try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); audioCtx.resume(); } catch (e) {}
-  reader = newReader(); scanning = true;
-  reader.decodeFromConstraints(
-    { audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } },
-    $('video'),
-    function (result) {
-      if (!result) return;
-      var code = result.getText(); var now = Date.now();
-      if (code === lastCode && now - lastTime < 4000) { lastTime = now; return; }   // same code still in view
-      lastCode = code; lastTime = now;
-      handleCode(code, ZXing.BarcodeFormat[result.getBarcodeFormat()]);
-    }
-  ).catch(function (e) {
+  navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+  }).then(function (s) {
+    stream = s; var v = $('video'); v.srcObject = s;
+    try {   // ask for continuous autofocus where the phone allows it
+      var tr = s.getVideoTracks()[0], caps = tr.getCapabilities ? tr.getCapabilities() : null;
+      if (caps && caps.focusMode && caps.focusMode.indexOf('continuous') > -1) tr.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    } catch (e) {}
+    return v.play().catch(function () {});
+  }).then(function () {
+    scanning = true; placeReticle(); tick();
+  }).catch(function (e) {
     stopScan();
     $('placeholder').classList.remove('hidden');
     $('placeholder').innerHTML = 'Camera unavailable (' + esc(e && e.name ? e.name : 'error') +
@@ -293,25 +366,64 @@ function startScan() {
   });
 }
 function stopScan() {
-  scanning = false;
-  try { if (reader) reader.reset(); } catch (e) {}
+  scanning = false; clearTimeout(timer);
+  if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+  try { $('video').srcObject = null; } catch (e) {}
   $('startBtn').classList.remove('hidden'); $('stopBtn').classList.add('hidden');
 }
 $('startBtn').addEventListener('click', startScan);
 $('stopBtn').addEventListener('click', function () { stopScan(); $('placeholder').classList.remove('hidden'); });
 
 // ---------------- Photo and manual fallbacks ----------------
+// A photo can hold several barcodes (an iPad box has many). Find them all and let you pick.
+function findAllInImage(img) {
+  var maxSide = 2400, w = img.naturalWidth, h = img.naturalHeight, k = Math.min(1, maxSide / Math.max(w, h));
+  var W = Math.round(w * k), H = Math.round(h * k);
+  var full = document.createElement('canvas'); full.width = W; full.height = H;
+  full.getContext('2d').drawImage(img, 0, 0, W, H);
+  var found = {}, order = [];
+  function add(res) { if (res && !found[res.text]) { found[res.text] = res; order.push(res); } }
+  add(decodeCanvas(full));
+  var c = document.createElement('canvas'), cx = c.getContext('2d', { willReadFrequently: true });
+  function region(x, y, rw, rh) {
+    c.width = Math.round(rw); c.height = Math.round(rh);
+    cx.drawImage(full, x, y, rw, rh, 0, 0, c.width, c.height);
+    add(decodeCanvas(c));
+  }
+  var bandH = H * 0.3;
+  for (var y = 0; y + bandH <= H + 1; y += H * 0.1) region(0, Math.min(y, H - bandH), W, bandH);   // horizontal strips
+  var bandW = W * 0.5;
+  for (var x = 0; x + bandW <= W + 1; x += W * 0.25) region(Math.min(x, W - bandW), 0, bandW, H);   // vertical halves
+  return order;
+}
+function chooseFromList(list) {
+  $('result').innerHTML = '<div class="muted">Found ' + list.length + ' codes. Tap the one you want to save:</div>' +
+    list.map(function (r, i) {
+      return '<div class="btnrow"><button class="secondary pick" data-i="' + i + '" style="text-align:left">' + esc(r.text) +
+        ' <span class="muted">' + esc(r.format) + '</span></button></div>';
+    }).join('');
+  Array.prototype.forEach.call(document.querySelectorAll('.pick'), function (b) {
+    b.addEventListener('click', function () { var r = list[+b.getAttribute('data-i')]; handleCode(r.text, r.format); });
+  });
+}
 $('photoBtn').addEventListener('click', function () { $('photoInput').click(); });
 $('photoInput').addEventListener('change', function () {
   var f = this.files && this.files[0]; this.value = ''; if (!f) return;
   if (typeof ZXing === 'undefined') { showResult('', '', '<span class="bad">Scanner library did not load.</span>', false); return; }
-  var url = URL.createObjectURL(f);
-  var r = newReader();
-  r.decodeFromImageUrl(url).then(function (res) {
-    handleCode(res.getText(), ZXing.BarcodeFormat[res.getBarcodeFormat()]);
-  }).catch(function () {
-    $('result').innerHTML = '<div class="status bad">No barcode found in that photo. Get closer, hold steady, and try again.</div>';
-  }).then(function () { URL.revokeObjectURL(url); try { r.reset(); } catch (e) {} });
+  $('result').innerHTML = '<div class="muted">Reading photo...</div>';
+  var url = URL.createObjectURL(f), img = new Image();
+  img.onload = function () {
+    setTimeout(function () {
+      var list = [];
+      try { list = findAllInImage(img); } catch (e) {}
+      URL.revokeObjectURL(url);
+      if (!list.length) $('result').innerHTML = '<div class="status bad">No barcode found in that photo. Get closer, hold steady, and try again.</div>';
+      else if (list.length === 1) handleCode(list[0].text, list[0].format);
+      else chooseFromList(list);
+    }, 30);
+  };
+  img.onerror = function () { URL.revokeObjectURL(url); $('result').innerHTML = '<div class="status bad">Could not open that photo.</div>'; };
+  img.src = url;
 });
 function addManual() {
   var v = $('manual').value.trim(); if (!v) return;
