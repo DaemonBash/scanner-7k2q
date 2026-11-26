@@ -356,7 +356,7 @@ renderDraft();
 
 // ---------------- Camera scanning ----------------
 var scanning = false, stream = null, timer = null;
-var lastCode = '', lastTime = 0;
+var seenAt = {};   // code -> last time the camera saw it
 var work = document.createElement('canvas');
 var wctx = work.getContext('2d', { willReadFrequently: true });
 var mfr = null, HINTS = null;
@@ -422,9 +422,9 @@ function tick() {
       res = decodeCanvas(work);
     }
     if (res) {
-      var now = Date.now();
-      if (res.text === lastCode && now - lastTime < 4000) { lastTime = now; }   // same code still in view
-      else { lastCode = res.text; lastTime = now; handleCode(res.text, res.format); }
+      var now = Date.now(), prev = seenAt[res.text];
+      seenAt[res.text] = now;                                   // refreshed every time the code is seen
+      if (!(prev && now - prev < 8000)) handleCode(res.text, res.format);   // ignore a code still in view or seen moments ago
     }
   }
   timer = setTimeout(tick, 120);
@@ -460,7 +460,7 @@ function startScan() {
   });
 }
 function stopScan() {
-  scanning = false; clearTimeout(timer);
+  scanning = false; clearTimeout(timer); seenAt = {};
   if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
   try { $('video').srcObject = null; } catch (e) {}
   $('startBtn').classList.remove('hidden'); $('stopBtn').classList.add('hidden');
