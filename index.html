@@ -53,6 +53,10 @@
   .slot .k { color:var(--muted); min-width:112px; }
   .slot .v { font-family:ui-monospace,Menlo,monospace; word-break:break-all; flex:1; }
   .slot .x { width:34px; padding:4px; font-size:14px; background:#2a3a4a; }
+  .thumbs { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .thumb { position:relative; }
+  .thumb img { width:72px; height:72px; object-fit:cover; border-radius:8px; border:1px solid var(--line); display:block; }
+  .thumb button { position:absolute; top:-6px; right:-6px; width:24px; height:24px; padding:0; border-radius:12px; font-size:13px; background:#e5534b; }
   .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
   .chips button { width:auto; padding:8px 10px; font-size:14px; }
 </style>
@@ -109,6 +113,13 @@
   <label>Current device: scan each barcode on the box, then tap Save device</label>
   <div id="slots"></div>
   <div id="pending"></div>
+  <div class="btnrow" style="margin-top:10px">
+    <button id="photoBtn" class="secondary">Add photo of box label</button>
+  </div>
+  <input id="photoInput" type="file" accept="image/*" capture="environment" class="hidden">
+  <div id="thumbs" class="thumbs"></div>
+  <div id="photoMsg" class="muted" style="margin-top:6px"></div>
+  <div id="harder" class="btnrow hidden"><button id="harderBtn" class="secondary">Look harder for small barcodes</button></div>
   <input id="notes" placeholder="Notes (optional)" style="margin-top:8px">
   <div class="btnrow">
     <button id="saveDev">Save device</button>
@@ -118,12 +129,8 @@
 </div>
 
 <div class="card">
-  <label>Camera not working? Take a photo of the barcode, or type it in.</label>
-  <div class="btnrow">
-    <button id="photoBtn" class="secondary">Take photo</button>
-  </div>
-  <input id="photoInput" type="file" accept="image/*" capture="environment" class="hidden">
-  <div class="row" style="margin-top:8px">
+  <label>Type or paste a code</label>
+  <div class="row">
     <input id="manual" placeholder="Type or paste a code" autocapitalize="characters" autocomplete="off">
     <button id="manualBtn" class="secondary" style="flex:0 0 90px">Add</button>
   </div>
@@ -235,6 +242,7 @@ function handleCode(raw, format) {
   var code = String(raw || '').trim();
   if (!code) return;
   var field = classify(code, format);
+  if (field === 'skip') return;
   if (field === 'serial' && $('stripS').checked && /^S/i.test(code) && code.length > 1) code = code.slice(1);
   var scan = {
     id: uuid(), code: code, format: format || 'MANUAL',
@@ -285,13 +293,15 @@ function undoLast() {
 var SLOTS = [['serial', 'Serial'], ['part', 'Part / Model No.'], ['upc', 'UPC'], ['imei', 'IMEI'],
              ['imei2', 'IMEI 2'], ['eid', 'EID'], ['other', 'Asset tag / other']];
 var draft = loadDraft();
-function newDraft() { return { id: uuid(), fields: {}, pending: '' }; }
-function loadDraft() { try { var d = JSON.parse(store.get('ds_draft')); if (d && d.fields) return d; } catch (e) {} return newDraft(); }
+var photos = [];   // pictures attached to the current device (kept in memory)
+function newDraft() { return { id: uuid(), fields: {}, pending: '', more: [] }; }
+function loadDraft() { try { var d = JSON.parse(store.get('ds_draft')); if (d && d.fields) { d.more = d.more || []; return d; } } catch (e) {} return newDraft(); }
 function saveDraftLocal() { store.set('ds_draft', JSON.stringify(draft)); }
 
 // Guess which slot a scanned code belongs in. Returns null when unsure, and you pick.
 function classify(code, fmt) {
   var c = String(code).trim();
+  if (/^(QR_CODE|DATA_MATRIX)$/.test(fmt) && /apple\.com|apple\.co\b/i.test(c)) return 'skip';   // same on every box, not an ID
   if (/^(UPC_A|UPC_E|EAN_13|EAN_8)$/.test(fmt)) return 'upc';
   if (/^\d{15}$/.test(c)) return (draft.fields.imei && draft.fields.imei !== c) ? 'imei2' : 'imei';
   if (/^\d{32}$/.test(c)) return 'eid';
@@ -301,7 +311,8 @@ function classify(code, fmt) {
   return null;
 }
 function assignToDraft(code, field) {
-  if (field) { draft.fields[field] = code; draft.pending = ''; }
+  if (field) { draft.fields[field] = code; }
+  else if (draft.pending) { if (draft.pending !== code && draft.more.indexOf(code) < 0) draft.more.push(code); }
   else { draft.pending = code; }
   saveDraftLocal(); renderDraft();
 }
@@ -323,14 +334,14 @@ function renderDraft() {
       b.addEventListener('click', function () {
         var k = b.getAttribute('data-k');
         if (k) draft.fields[k] = draft.pending;
-        draft.pending = ''; saveDraftLocal(); renderDraft();
+        draft.pending = draft.more.shift() || ''; saveDraftLocal(); renderDraft();
       });
     });
   } else { $('pending').innerHTML = ''; }
   $('notes').value = draft.notes || '';
 }
 $('notes').addEventListener('input', function () { draft.notes = $('notes').value; saveDraftLocal(); });
-function resetDraft() { draft = newDraft(); saveDraftLocal(); renderDraft(); }
+function resetDraft() { draft = newDraft(); photos = []; lastPhoto = null; saveDraftLocal(); renderDraft(); renderPhotos(); }
 $('clearDev').addEventListener('click', function () { resetDraft(); $('devStatus').innerHTML = ''; });
 $('saveDev').addEventListener('click', function () {
   var f = draft.fields;
@@ -338,17 +349,25 @@ $('saveDev').addEventListener('click', function () {
     $('devStatus').innerHTML = '<span class="warn">Scan a serial, IMEI, EID or asset tag first.</span>'; return;
   }
   var payload = { id: draft.id, fields: f, notes: ($('notes').value || '').trim(), deviceType: $('deviceType').value.trim(),
-                  scannedBy: $('scannedBy').value.trim(), location: $('location').value, ts: new Date().toISOString() };
-  $('devStatus').innerHTML = '<span class="muted">Saving...</span>';
+                  scannedBy: $('scannedBy').value.trim(), location: $('location').value, ts: new Date().toISOString(),
+                  photos: photos.map(function (p) { return { data: p.data }; }) };
+  $('devStatus').innerHTML = '<span class="muted">Saving' + (photos.length ? ' (uploading ' + photos.length + ' photo' + (photos.length > 1 ? 's' : '') + ' and reading the label; this can take 10 to 30 seconds)' : '') + '...</span>';
   callServer('saveDevice', payload).then(function (res) {
     if (!res || !res.ok) throw new Error((res && res.error) || 'Server said no');
-    $('devStatus').innerHTML = res.existing
+    var d = res.details || {}, bits = [d.name, d.storage, d.color].filter(Boolean).join(', ');
+    var more = bits ? '<br><span class="muted">Model: ' + esc(bits) + (d.source ? ' (from ' + esc(d.source) + ')' : '') + '</span>'
+      : (payload.photos.length ? '<br><span class="warn">Model details were not filled in. Check the row in the Sheet.</span>' : '');
+    $('devStatus').innerHTML = (res.existing
       ? '<span class="warn">Already in the list (first saved ' + esc(res.firstSaved || '') + '). Updated that row.</span>'
-      : '<span class="ok">Device saved. Ready for the next one.</span>';
+      : '<span class="ok">Device saved. Ready for the next one.</span>') + more;
     beep(res.existing ? 330 : 880, 150); resetDraft();
   }).catch(function (e) {
-    var q = getQueue(); q.push({ fn: 'saveDevice', payload: payload, id: payload.id }); setQueue(q);
-    $('devStatus').innerHTML = '<span class="bad">Not sent (' + esc(e.message) + '). Kept on this phone and will retry.</span>';
+    var q = getQueue(), note = '';
+    q.push({ fn: 'saveDevice', payload: payload, id: payload.id });
+    try { localStorage.setItem('ds_queue', JSON.stringify(q)); }
+    catch (err) { payload.photos = []; note = ' The photos did not fit and were left out.'; q[q.length - 1].payload = payload; }
+    setQueue(q);
+    $('devStatus').innerHTML = '<span class="bad">Not sent (' + esc(e.message) + '). Kept on this phone and will retry.' + note + '</span>';
     resetDraft();
   });
 });
@@ -363,7 +382,7 @@ var mfr = null, HINTS = null;
 
 function formats() {
   var F = ZXing.BarcodeFormat;
-  return [F.CODE_128, F.QR_CODE, F.EAN_13, F.UPC_A, F.UPC_E, F.EAN_8, F.CODE_39, F.CODE_93, F.ITF, F.DATA_MATRIX, F.PDF_417, F.AZTEC];
+  return [F.CODE_128, F.CODE_39, F.EAN_13, F.UPC_A, F.QR_CODE, F.DATA_MATRIX];
 }
 function decodeCanvas(c) {
   if (!mfr) {
@@ -468,57 +487,101 @@ function stopScan() {
 $('startBtn').addEventListener('click', startScan);
 $('stopBtn').addEventListener('click', function () { stopScan(); $('placeholder').classList.remove('hidden'); });
 
-// ---------------- Photo and manual fallbacks ----------------
-// A photo can hold several barcodes (an iPad box has many). Find them all and let you pick.
-function findAllInImage(img) {
-  var maxSide = 2400, w = img.naturalWidth, h = img.naturalHeight, k = Math.min(1, maxSide / Math.max(w, h));
-  var W = Math.round(w * k), H = Math.round(h * k);
-  var full = document.createElement('canvas'); full.width = W; full.height = H;
-  full.getContext('2d').drawImage(img, 0, 0, W, H);
-  var found = {}, order = [];
-  function add(res) { if (res && !found[res.text]) { found[res.text] = res; order.push(res); } }
-  add(decodeCanvas(full));
-  var c = document.createElement('canvas'), cx = c.getContext('2d', { willReadFrequently: true });
-  function region(x, y, rw, rh) {
-    c.width = Math.round(rw); c.height = Math.round(rh);
-    cx.drawImage(full, x, y, rw, rh, 0, 0, c.width, c.height);
-    add(decodeCanvas(c));
-  }
-  var bandH = H * 0.3;
-  for (var y = 0; y + bandH <= H + 1; y += H * 0.1) region(0, Math.min(y, H - bandH), W, bandH);   // horizontal strips
-  var bandW = W * 0.5;
-  for (var x = 0; x + bandW <= W + 1; x += W * 0.25) region(Math.min(x, W - bandW), 0, bandW, H);   // vertical halves
-  return order;
-}
-function chooseFromList(list) {
-  $('result').innerHTML = '<div class="muted">Found ' + list.length + ' codes. Tap the one you want to save:</div>' +
-    list.map(function (r, i) {
-      return '<div class="btnrow"><button class="secondary pick" data-i="' + i + '" style="text-align:left">' + esc(r.text) +
-        ' <span class="muted">' + esc(r.format) + '</span></button></div>';
-    }).join('');
-  Array.prototype.forEach.call(document.querySelectorAll('.pick'), function (b) {
-    b.addEventListener('click', function () { var r = list[+b.getAttribute('data-i')]; handleCode(r.text, r.format); });
+// ---------------- Photos: read every barcode in the picture and keep the picture ----------------
+var lastPhoto = null;   // { img, url, handled:{} } for the newest photo, so "Look harder" can reuse it
+var GOOD_DEEP = /^(CODE_128|UPC_A|EAN_13|QR_CODE|DATA_MATRIX)$/;
+
+// Find barcodes in a picture. Quick pass first; deep = enlarge overlapping tiles for small barcodes.
+function findAllInImage(img, deep) {
+  return new Promise(function (resolve) {
+    var maxSide = 3000, w = img.naturalWidth, h = img.naturalHeight, k = Math.min(1, maxSide / Math.max(w, h));
+    var W = Math.round(w * k), H = Math.round(h * k);
+    var full = document.createElement('canvas'); full.width = W; full.height = H;
+    full.getContext('2d').drawImage(img, 0, 0, W, H);
+    var found = {}, order = [], jobs = [];
+    var c = document.createElement('canvas'), cx = c.getContext('2d', { willReadFrequently: true });
+    function add(res) {
+      if (!res || found[res.text]) return;
+      if (deep && !GOOD_DEEP.test(res.format)) return;          // tiles can produce junk reads; keep only solid types
+      found[res.text] = 1; order.push(res);
+    }
+    function region(x, y, rw, rh, up) {
+      jobs.push(function () {
+        c.width = Math.max(1, Math.round(rw * up)); c.height = Math.max(1, Math.round(rh * up));
+        cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+        cx.drawImage(full, x, y, rw, rh, 0, 0, c.width, c.height);
+        add(decodeCanvas(c));
+      });
+    }
+    if (!deep) {
+      jobs.push(function () { add(decodeCanvas(full)); });
+      var bandH = H * 0.3;
+      for (var y = 0; y + bandH <= H + 1; y += H * 0.1) region(0, Math.min(y, H - bandH), W, bandH, 1);
+      var bandW = W * 0.5;
+      for (var x = 0; x + bandW <= W + 1; x += W * 0.25) region(Math.min(x, W - bandW), 0, bandW, H, 1);
+    } else {
+      [[0.55, 0.14], [0.4, 0.2], [0.3, 0.1]].forEach(function (ts) {
+        var tw = W * ts[0], th = H * ts[1], up = Math.min(3, Math.max(1, 1400 / tw));
+        for (var ty = 0; ty < H - 1; ty += th * 0.5) {
+          for (var tx = 0; tx < W - 1; tx += tw * 0.5) region(Math.min(tx, W - tw), Math.min(ty, H - th), tw, th, up);
+        }
+      });
+    }
+    (function step() {          // work in small slices so the page stays responsive
+      var t0 = Date.now();
+      while (jobs.length && Date.now() - t0 < 50) jobs.shift()();
+      if (jobs.length) setTimeout(step, 0); else resolve(order);
+    })();
   });
+}
+
+function shrinkToJpeg(img, maxSide, quality) {
+  var k = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+  var c = document.createElement('canvas'); c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', quality);
+}
+function renderPhotos() {
+  $('thumbs').innerHTML = photos.map(function (p) {
+    return '<div class="thumb"><img src="' + p.thumb + '" alt="photo"><button data-id="' + p.id + '" aria-label="Remove photo">x</button></div>';
+  }).join('');
+  Array.prototype.forEach.call(document.querySelectorAll('.thumb button'), function (b) {
+    b.addEventListener('click', function () { photos = photos.filter(function (p) { return p.id !== b.getAttribute('data-id'); }); renderPhotos(); });
+  });
+  if (!photos.length) $('photoMsg').textContent = '';
+}
+function applyFound(list, label) {
+  var fresh = list.filter(function (r) { return !lastPhoto.handled[r.text]; });
+  fresh.forEach(function (r) { lastPhoto.handled[r.text] = 1; handleCode(r.text, r.format); });
+  var n = Object.keys(lastPhoto.handled).length;
+  $('photoMsg').textContent = n
+    ? label + ' ' + n + ' barcode' + (n > 1 ? 's' : '') + ' read from this photo. Check the slots above.'
+    : 'No barcodes read from that photo. It is still attached. Try Look harder, or get closer.';
+  $('harder').classList.remove('hidden');
 }
 $('photoBtn').addEventListener('click', function () { $('photoInput').click(); });
 $('photoInput').addEventListener('change', function () {
   var f = this.files && this.files[0]; this.value = ''; if (!f) return;
-  if (typeof ZXing === 'undefined') { showResult('', '', '<span class="bad">Scanner library did not load.</span>', false); return; }
-  $('result').innerHTML = '<div class="muted">Reading photo...</div>';
+  if (typeof ZXing === 'undefined') { $('photoMsg').textContent = 'Scanner library did not load.'; return; }
+  if (lastPhoto) { try { URL.revokeObjectURL(lastPhoto.url); } catch (e) {} }
+  $('photoMsg').textContent = 'Reading photo...'; $('harder').classList.add('hidden');
   var url = URL.createObjectURL(f), img = new Image();
   img.onload = function () {
-    setTimeout(function () {
-      var list = [];
-      try { list = findAllInImage(img); } catch (e) {}
-      URL.revokeObjectURL(url);
-      if (!list.length) $('result').innerHTML = '<div class="status bad">No barcode found in that photo. Get closer, hold steady, and try again.</div>';
-      else if (list.length === 1) handleCode(list[0].text, list[0].format);
-      else chooseFromList(list);
-    }, 30);
+    var jpg = shrinkToJpeg(img, 2000, 0.78);   // big enough for the label text to be readable
+    if (photos.length < 4) { photos.push({ id: uuid(), data: jpg.split(',')[1], thumb: shrinkToJpeg(img, 160, 0.6) }); renderPhotos(); }
+    lastPhoto = { img: img, url: url, handled: {} };
+    $('photoMsg').textContent = 'Reading photo...';
+    setTimeout(function () { findAllInImage(img, false).then(function (list) { applyFound(list, 'Found'); }); }, 30);
   };
-  img.onerror = function () { URL.revokeObjectURL(url); $('result').innerHTML = '<div class="status bad">Could not open that photo.</div>'; };
+  img.onerror = function () { URL.revokeObjectURL(url); $('photoMsg').textContent = 'Could not open that photo.'; };
   img.src = url;
 });
+$('harderBtn').addEventListener('click', function () {
+  if (!lastPhoto) return;
+  $('photoMsg').textContent = 'Looking harder... this can take up to half a minute.'; $('harder').classList.add('hidden');
+  findAllInImage(lastPhoto.img, true).then(function (list) { applyFound(list, 'Now'); });
+});
+renderPhotos();
 function addManual() {
   var v = $('manual').value.trim(); if (!v) return;
   $('manual').value = ''; handleCode(v, 'MANUAL');
