@@ -125,6 +125,15 @@
   <div id="devStatus" class="status"></div>
 </div>
 
+<div class="card" id="findCard">
+  <label>Add details to a device already saved (like a phone number)</label>
+  <div class="row">
+    <input id="findQ" placeholder="Serial, IMEI, tag or name" autocapitalize="characters" autocomplete="off">
+    <button id="findBtn" class="secondary" style="flex:0 0 90px">Find</button>
+  </div>
+  <div id="findRes" class="muted" style="margin-top:6px"></div>
+</div>
+
 <div class="card">
   <label>Type or paste a code</label>
   <div class="row">
@@ -178,6 +187,11 @@ var OTHER_LABEL = 'Other (type it in)';
   if (saved && DEVICE_TYPES.indexOf(saved) >= 0) sel.value = saved;
   else if (saved) sel.value = '__other';
   show();
+  window.setDeviceType = function (v) {
+    txt.value = v || '';
+    sel.value = !v ? '' : (DEVICE_TYPES.indexOf(v) >= 0 ? v : '__other');
+    show(); store.set('ds_deviceType', txt.value);
+  };
   sel.addEventListener('change', function () {
     if (sel.value === '__other') { txt.value = ''; show(); txt.focus(); }
     else { txt.value = sel.value; show(); }
@@ -307,7 +321,7 @@ function undoLast() {
 
 // ---------------- Current device (one row per device on the "Devices" tab) ----------------
 var SLOTS = [['serial', 'Serial'], ['part', 'Part / Model No.'], ['upc', 'UPC'], ['imei', 'IMEI'],
-             ['imei2', 'IMEI 2'], ['eid', 'EID'], ['other', 'Asset tag / other']];
+             ['imei2', 'IMEI 2'], ['phone', 'Phone number'], ['eid', 'EID'], ['other', 'Asset tag / other']];
 var draft = loadDraft();
 var photos = [];   // pictures attached to the current device (kept in memory)
 function newDraft() { return { id: uuid(), fields: {}, pending: '', more: [] }; }
@@ -318,6 +332,7 @@ function saveDraftLocal() { store.set('ds_draft', JSON.stringify(draft)); }
 function classify(code, fmt) {
   var c = String(code).trim();
   if (/^(QR_CODE|DATA_MATRIX)$/.test(fmt) && /apple\.com|apple\.co\b/i.test(c)) return 'skip';   // same on every box, not an ID
+  if (/^\+?1?[\s.-]?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}$/.test(c)) return 'phone';   // typed like (214) 555-0123
   if (/^(UPC_A|UPC_E|EAN_13|EAN_8)$/.test(fmt)) {
     var cur = draft.fields.upc;
     if (!cur || cur === c) return 'upc';
@@ -369,6 +384,35 @@ function renderDraft() {
 }
 $('notes').addEventListener('input', function () { draft.notes = $('notes').value; saveDraftLocal(); });
 function resetDraft() { draft = newDraft(); photos = []; lastPhoto = null; saveDraftLocal(); renderDraft(); renderPhotos(); }
+
+// ---------- Find a saved device and add to it ----------
+function doFind() {
+  var q = $('findQ').value.trim();
+  if (q.length < 3) { $('findRes').innerHTML = '<span class="muted">Type at least 3 characters.</span>'; return; }
+  $('findRes').innerHTML = '<span class="muted">Searching...</span>';
+  callServer('findDevices', { q: q }).then(function (res) {
+    if (!res || !res.ok) throw new Error((res && res.error) || 'Search failed');
+    var ms = res.matches || [];
+    if (!ms.length) { $('findRes').innerHTML = '<span class="muted">No saved device matches that.</span>'; return; }
+    $('findRes').innerHTML = ms.map(function (m, i) {
+      var label = [m.serial || m.imei || m.eid || m.other, m.type, m.name, m.phone && ('Phone ' + m.phone)].filter(Boolean).join(' | ');
+      return '<button class="secondary findpick" data-i="' + i + '" style="width:100%;text-align:left;margin-top:6px">' + esc(label) + '</button>';
+    }).join('');
+    Array.prototype.forEach.call(document.querySelectorAll('.findpick'), function (b) {
+      b.addEventListener('click', function () {
+        var m = ms[Number(b.getAttribute('data-i'))];
+        resetDraft();
+        ['serial', 'part', 'upc', 'imei', 'imei2', 'phone', 'eid', 'other'].forEach(function (k) { if (m[k]) draft.fields[k] = m[k]; });
+        if (m.type) window.setDeviceType(m.type);
+        saveDraftLocal(); renderDraft();
+        $('findRes').innerHTML = '<span class="ok">Loaded. Add the phone number below (type it in "Type or paste a code"), then tap Save device.</span>';
+        $('deviceCard').scrollIntoView({ behavior: 'smooth' });
+      });
+    });
+  }).catch(function (e) { $('findRes').innerHTML = '<span class="warn">Could not search: ' + esc(e.message) + '</span>'; });
+}
+$('findBtn').addEventListener('click', doFind);
+$('findQ').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doFind(); } });
 $('clearDev').addEventListener('click', function () { resetDraft(); $('devStatus').innerHTML = ''; });
 $('saveDev').addEventListener('click', function () {
   var f = draft.fields;
