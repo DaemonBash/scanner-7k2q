@@ -76,6 +76,10 @@
       </select></div>
   </div>
   <div style="margin-top:8px">
+    <label for="listSel">Save to</label>
+    <select id="listSel"><option value="devices">Devices (technology)</option><option value="tools">Tools</option></select>
+  </div>
+  <div style="margin-top:8px">
     <label for="deviceType">Device type</label>
     <select id="deviceTypeSel"></select>
     <input id="deviceType" placeholder="Type the device type" style="display:none;margin-top:6px">
@@ -117,11 +121,14 @@
   <div id="thumbs" class="thumbs"></div>
   <div id="photoMsg" class="muted" style="margin-top:6px"></div>
   <div id="harder" class="btnrow hidden"><button id="harderBtn" class="secondary">Look harder for small barcodes</button></div>
+  <input id="brand" placeholder="Brand (optional, filled from the label photo if left blank)" style="margin-top:8px">
   <input id="notes" placeholder="Notes (optional)" style="margin-top:8px">
   <div class="btnrow">
     <button id="saveDev">Save device</button>
     <button id="clearDev" class="secondary">Clear</button>
   </div>
+  <div class="btnrow"><button id="saveNext" class="secondary">Save, then another device from this box</button></div>
+  <div id="spare" class="muted" style="margin-top:6px"></div>
   <div id="devStatus" class="status"></div>
 </div>
 
@@ -174,24 +181,38 @@ function timeLabel(d) { return d.toLocaleTimeString([], { hour: 'numeric', minut
   $(id).addEventListener('input', function () { store.set('ds_' + id, $(id).value); });
 });
 $('stripS').checked = store.get('ds_stripS') === '1';
-// Device type dropdown. Edit this list to change the choices; "Other" lets you type your own.
-var DEVICE_TYPES = ['iPad', 'iPhone', 'Apple Pencil', 'Apple Watch', 'Laptop', 'Phone (Android)', 'Tablet (other)', 'Keyboard / accessory', 'GPS', 'GPS Camera', 'Power tool', 'Hand tool', 'Asset tag'];
+// Device type dropdown. Edit these lists to change the choices; "Other" lets you type your own.
+var TYPES_BY_LIST = {
+  devices: ['iPad', 'iPhone', 'Apple Pencil', 'Apple Watch', 'Laptop', 'Phone (Android)', 'Tablet (other)', 'Keyboard / accessory', 'GPS', 'GPS Camera', 'Asset tag'],
+  tools: ['Power tool', 'Hand tool']
+};
 var OTHER_LABEL = 'Other (type it in)';
+function currentList() { return $('listSel').value === 'tools' ? 'tools' : 'devices'; }
 (function () {
-  var sel = $('deviceTypeSel'), txt = $('deviceType');
-  sel.innerHTML = '<option value="">Choose a device type...</option>' +
-    DEVICE_TYPES.map(function (t) { return '<option>' + esc(t) + '</option>'; }).join('') +
-    '<option value="__other">' + OTHER_LABEL + '</option>';
+  var sel = $('deviceTypeSel'), txt = $('deviceType'), listSel = $('listSel');
+  var savedList = store.get('ds_list'); if (savedList === 'tools' || savedList === 'devices') listSel.value = savedList;
+  function types() { return TYPES_BY_LIST[currentList()]; }
+  function build() {
+    sel.innerHTML = '<option value="">Choose a device type...</option>' +
+      types().map(function (t) { return '<option>' + esc(t) + '</option>'; }).join('') +
+      '<option value="__other">' + OTHER_LABEL + '</option>';
+  }
   function show() { txt.style.display = sel.value === '__other' ? '' : 'none'; }
-  var saved = txt.value;
-  if (saved && DEVICE_TYPES.indexOf(saved) >= 0) sel.value = saved;
-  else if (saved) sel.value = '__other';
-  show();
+  function sync() {
+    var v = txt.value;
+    sel.value = !v ? '' : (types().indexOf(v) >= 0 ? v : '__other');
+    if (sel.value !== v && v && sel.value !== '__other') sel.value = '__other';
+    show();
+  }
+  build(); sync();
   window.setDeviceType = function (v) {
-    txt.value = v || '';
-    sel.value = !v ? '' : (DEVICE_TYPES.indexOf(v) >= 0 ? v : '__other');
-    show(); store.set('ds_deviceType', txt.value);
+    txt.value = v || ''; sync(); store.set('ds_deviceType', txt.value);
   };
+  window.setList = function (l) { listSel.value = l === 'tools' ? 'tools' : 'devices'; store.set('ds_list', listSel.value); build(); sync(); };
+  listSel.addEventListener('change', function () {
+    store.set('ds_list', listSel.value); build();
+    txt.value = ''; sel.value = ''; show(); store.set('ds_deviceType', '');   // the old choice does not belong to the other list
+  });
   sel.addEventListener('change', function () {
     if (sel.value === '__other') { txt.value = ''; show(); txt.focus(); }
     else { txt.value = sel.value; show(); }
@@ -324,8 +345,8 @@ var SLOTS = [['serial', 'Serial'], ['part', 'Part / Model No.'], ['upc', 'UPC'],
              ['imei2', 'IMEI 2'], ['phone', 'Phone number'], ['eid', 'EID'], ['other', 'Asset tag / other']];
 var draft = loadDraft();
 var photos = [];   // pictures attached to the current device (kept in memory)
-function newDraft() { return { id: uuid(), fields: {}, pending: '', more: [] }; }
-function loadDraft() { try { var d = JSON.parse(store.get('ds_draft')); if (d && d.fields) { d.more = d.more || []; return d; } } catch (e) {} return newDraft(); }
+function newDraft() { return { id: uuid(), fields: {}, pending: '', more: [], spare: [] }; }
+function loadDraft() { try { var d = JSON.parse(store.get('ds_draft')); if (d && d.fields) { d.more = d.more || []; d.spare = d.spare || []; return d; } } catch (e) {} return newDraft(); }
 function saveDraftLocal() { store.set('ds_draft', JSON.stringify(draft)); }
 
 // Guess which slot a scanned code belongs in. Returns null when unsure, and you pick.
@@ -349,7 +370,18 @@ function classify(code, fmt) {
   if (/^\d{32}$/.test(c)) return 'eid';
   if (/^[A-Z0-9]{3,6}[A-Z]{1,3}\/[A-Z0-9]$/i.test(c) || /^A\d{4}$/i.test(c)) return 'part';
   if (/^(QR_CODE|DATA_MATRIX|AZTEC|PDF_417)$/.test(fmt)) return 'other';
-  if (/^[A-Z0-9]{8,12}$/i.test(c) && /[A-Z]/i.test(c) && /\d/.test(c)) return 'serial';
+  if (/^[A-Z0-9]{3,}[-_][A-Z0-9_\-]{2,}$/i.test(c) && /\d/.test(c) && c.length <= 30) return 'part';   // model numbers like 981-000570 or A2K01_Zonar
+  if (/^[A-Z0-9]{8,20}$/i.test(c) && /[A-Z]/i.test(c) && /\d/.test(c)) {
+    // A box can hold two devices (like a GPS tracker and its dash cam). The first serial fills the slot,
+    // later different ones wait in "Also on this box" for the next device.
+    if (draft.fields.serial && draft.fields.serial !== c) {
+      draft.spare = draft.spare || [];
+      if (draft.spare.indexOf(c) < 0) draft.spare.push(c);
+      saveDraftLocal(); renderDraft();
+      return 'skip';
+    }
+    return 'serial';
+  }
   return null;
 }
 function assignToDraft(code, field) {
@@ -381,8 +413,21 @@ function renderDraft() {
     });
   } else { $('pending').innerHTML = ''; }
   $('notes').value = draft.notes || '';
+  $('brand').value = draft.brand || '';
+  var sp = draft.spare || [];
+  $('spare').innerHTML = sp.length ? 'Also on this box: ' + sp.map(function (c, i) {
+    return '<b>' + esc(c) + '</b> <button class="secondary usespare" data-i="' + i + '" style="padding:4px 10px">Use as serial</button>';
+  }).join(' ') : '';
+  Array.prototype.forEach.call(document.querySelectorAll('.usespare'), function (b) {
+    b.addEventListener('click', function () {
+      var i = Number(b.getAttribute('data-i')), c = draft.spare[i];
+      if (draft.fields.serial) draft.spare[i] = draft.fields.serial; else draft.spare.splice(i, 1);
+      draft.fields.serial = c; saveDraftLocal(); renderDraft();
+    });
+  });
 }
 $('notes').addEventListener('input', function () { draft.notes = $('notes').value; saveDraftLocal(); });
+$('brand').addEventListener('input', function () { draft.brand = $('brand').value; saveDraftLocal(); });
 function resetDraft() { draft = newDraft(); photos = []; lastPhoto = null; saveDraftLocal(); renderDraft(); renderPhotos(); }
 
 // ---------- Find a saved device and add to it ----------
@@ -390,12 +435,12 @@ function doFind() {
   var q = $('findQ').value.trim();
   if (q.length < 3) { $('findRes').innerHTML = '<span class="muted">Type at least 3 characters.</span>'; return; }
   $('findRes').innerHTML = '<span class="muted">Searching...</span>';
-  callServer('findDevices', { q: q }).then(function (res) {
+  callServer('findDevices', { q: q, list: currentList() }).then(function (res) {
     if (!res || !res.ok) throw new Error((res && res.error) || 'Search failed');
     var ms = res.matches || [];
     if (!ms.length) { $('findRes').innerHTML = '<span class="muted">No saved device matches that.</span>'; return; }
     $('findRes').innerHTML = ms.map(function (m, i) {
-      var label = [m.serial || m.imei || m.eid || m.other, m.type, m.name, m.phone && ('Phone ' + m.phone)].filter(Boolean).join(' | ');
+      var label = [m.serial || m.imei || m.eid || m.other, m.type, [m.brand, m.name].filter(Boolean).join(' '), m.phone && ('Phone ' + m.phone)].filter(Boolean).join(' | ');
       return '<button class="secondary findpick" data-i="' + i + '" style="width:100%;text-align:left;margin-top:6px">' + esc(label) + '</button>';
     }).join('');
     Array.prototype.forEach.call(document.querySelectorAll('.findpick'), function (b) {
@@ -403,6 +448,7 @@ function doFind() {
         var m = ms[Number(b.getAttribute('data-i'))];
         resetDraft();
         ['serial', 'part', 'upc', 'imei', 'imei2', 'phone', 'eid', 'other'].forEach(function (k) { if (m[k]) draft.fields[k] = m[k]; });
+        if (m.brand) draft.brand = m.brand;
         if (m.type) window.setDeviceType(m.type);
         saveDraftLocal(); renderDraft();
         $('findRes').innerHTML = '<span class="ok">Loaded. Add the phone number below (type it in "Type or paste a code"), then tap Save device.</span>';
@@ -414,24 +460,37 @@ function doFind() {
 $('findBtn').addEventListener('click', doFind);
 $('findQ').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doFind(); } });
 $('clearDev').addEventListener('click', function () { resetDraft(); $('devStatus').innerHTML = ''; });
-$('saveDev').addEventListener('click', function () {
+function saveCurrent(another) {
   var f = draft.fields;
   if (!(f.serial || f.imei || f.imei2 || f.eid || f.other)) {
     $('devStatus').innerHTML = '<span class="warn">Scan a serial, IMEI, EID or asset tag first.</span>'; return;
   }
-  var payload = { id: draft.id, fields: f, notes: ($('notes').value || '').trim(), deviceType: $('deviceType').value.trim(),
+  var fields = {}; Object.keys(f).forEach(function (k) { fields[k] = f[k]; });
+  var brand = ($('brand').value || '').trim(); if (brand) fields.brand = brand;
+  var payload = { id: draft.id, list: currentList(), fields: fields, notes: ($('notes').value || '').trim(), deviceType: $('deviceType').value.trim(),
                   scannedBy: $('scannedBy').value.trim(), location: $('location').value, ts: new Date().toISOString(),
                   photos: photos.map(function (p) { return { data: p.data }; }) };
+  var nextSerial = (draft.spare || [])[0] || '', restSpare = (draft.spare || []).slice(1);
+  // After a save for "another device from this box": same photos and brand, the next serial from the box, nothing else.
+  function afterSave() {
+    if (!another) { resetDraft(); return; }
+    var keepBrand = $('brand').value;
+    draft = newDraft(); draft.brand = keepBrand; draft.spare = restSpare;
+    if (nextSerial) draft.fields.serial = nextSerial;
+    saveDraftLocal(); renderDraft();
+    window.setDeviceType('');
+  }
   $('devStatus').innerHTML = '<span class="muted">Saving' + (photos.length ? ' (uploading ' + photos.length + ' photo' + (photos.length > 1 ? 's' : '') + ' and reading the label; this can take 10 to 30 seconds)' : '') + '...</span>';
   callServer('saveDevice', payload).then(function (res) {
     if (!res || !res.ok) throw new Error((res && res.error) || 'Server said no');
-    var d = res.details || {}, bits = [d.name, d.storage, d.color].filter(Boolean).join(', ');
-    var more = bits ? '<br><span class="muted">Model: ' + esc(bits) + (d.source ? ' (from ' + esc(d.source) + ')' : '') + '</span>'
-      : (payload.photos.length ? '<br><span class="warn">Model details were not filled in. Check the row in the Sheet.</span>' : '');
+    var d = res.details || {}, bits = [d.brand, d.name, d.storage, d.color].filter(Boolean).join(', ');
+    var more = bits ? '<br><span class="muted">Details: ' + esc(bits) + (d.source ? ' (from ' + esc(d.source) + ')' : '') + '</span>'
+      : (payload.photos.length ? '<br><span class="warn">Details were not filled in. Check the row in the Sheet.</span>' : '');
+    var next = another ? '<br><span class="ok">Now the next device from this box' + (nextSerial ? ': serial ' + esc(nextSerial) : '') + '. Pick its device type.</span>' : '';
     $('devStatus').innerHTML = (res.existing
       ? '<span class="warn">Already in the list (first saved ' + esc(res.firstSaved || '') + '). Updated that row.</span>'
-      : '<span class="ok">Device saved. Ready for the next one.</span>') + more;
-    beep(res.existing ? 330 : 880, 150); resetDraft();
+      : '<span class="ok">Device saved.' + (another ? '' : ' Ready for the next one.') + '</span>') + more + next;
+    beep(res.existing ? 330 : 880, 150); afterSave();
   }).catch(function (e) {
     var q = getQueue(), note = '';
     q.push({ fn: 'saveDevice', payload: payload, id: payload.id });
@@ -439,9 +498,11 @@ $('saveDev').addEventListener('click', function () {
     catch (err) { payload.photos = []; note = ' The photos did not fit and were left out.'; q[q.length - 1].payload = payload; }
     setQueue(q);
     $('devStatus').innerHTML = '<span class="bad">Not sent (' + esc(e.message) + '). Kept on this phone and will retry.' + note + '</span>';
-    resetDraft();
+    afterSave();
   });
-});
+}
+$('saveDev').addEventListener('click', function () { saveCurrent(false); });
+$('saveNext').addEventListener('click', function () { saveCurrent(true); });
 renderDraft();
 
 // ---------------- Camera scanning ----------------
