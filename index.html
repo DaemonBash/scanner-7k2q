@@ -302,7 +302,18 @@ function saveDraftLocal() { store.set('ds_draft', JSON.stringify(draft)); }
 function classify(code, fmt) {
   var c = String(code).trim();
   if (/^(QR_CODE|DATA_MATRIX)$/.test(fmt) && /apple\.com|apple\.co\b/i.test(c)) return 'skip';   // same on every box, not an ID
-  if (/^(UPC_A|UPC_E|EAN_13|EAN_8)$/.test(fmt)) return 'upc';
+  if (/^(UPC_A|UPC_E|EAN_13|EAN_8)$/.test(fmt)) {
+    var cur = draft.fields.upc;
+    if (!cur || cur === c) return 'upc';
+    // A box can carry two product codes (US UPC and a regional EAN). The 12-digit UPC-A keeps the UPC slot;
+    // the other one is kept in Notes so it is not lost and cannot match other devices.
+    var keep = (fmt === 'UPC_A' && !/^\d{12}$/.test(cur)) ? c : cur, other = (keep === c) ? cur : c;
+    draft.fields.upc = keep;
+    var tag = 'Other product code: ' + other;
+    if ((draft.notes || '').indexOf(other) < 0) draft.notes = ((draft.notes || '') + (draft.notes ? '; ' : '') + tag);
+    saveDraftLocal(); renderDraft();
+    return 'skip';
+  }
   if (/^\d{15}$/.test(c)) return (draft.fields.imei && draft.fields.imei !== c) ? 'imei2' : 'imei';
   if (/^\d{32}$/.test(c)) return 'eid';
   if (/^[A-Z0-9]{3,6}[A-Z]{1,3}\/[A-Z0-9]$/i.test(c) || /^A\d{4}$/i.test(c)) return 'part';
